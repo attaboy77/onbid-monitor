@@ -1,0 +1,15 @@
+# 인증키 / 환경설정 (절대 커밋 금지)
+.env
+.env.*
+!.env.example
+
+# 파이썬
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,58 @@
+name: 온비드 상가 공매 일일 수집
+
+on:
+  schedule:
+    # 매일 08:00 KST = 전날 23:00 UTC (KST = UTC+9)
+    - cron: "0 23 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: onbid-daily
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 1) 물건 수집 (onbid_collect2.py)
+        env:
+          ONBID_KEY: ${{ secrets.ONBID_KEY }}
+        run: python onbid_collect2.py
+
+      - name: 2) 상세정보 조회 (onbid_detail.py)
+        env:
+          ONBID_KEY: ${{ secrets.ONBID_KEY }}
+        run: python onbid_detail.py
+
+      - name: 3) 수익성/권리분석 컬럼 추가 (onbid_add_metrics.py)
+        run: python onbid_add_metrics.py
+
+      - name: 신규 물건 요약 (Job Summary)
+        run: python onbid_summary.py >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 결과 커밋 & 푸시
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "변경된 데이터가 없어 커밋을 건너뜁니다."
+          else
+            git commit -m "chore: 온비드 데이터 자동 수집 $(date -u +'%Y-%m-%d')"
+            git push
+          fi
