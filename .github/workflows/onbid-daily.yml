@@ -43,11 +43,15 @@ jobs:
         run: python court_collect.py
 
       - name: 2) 상세정보 조회 (onbid_detail.py)
+        # API 장애로 상세조회가 전부 실패해도 스크립트는 경고만 남기고 목록 데이터로 CSV를 만든다.
+        # 예기치 못한 오류로 죽더라도 경매 데이터와 웹페이지는 나가도록 여기서도 건다.
+        continue-on-error: true
         env:
           ONBID_KEY: ${{ secrets.ONBID_KEY }}
         run: python onbid_detail.py
 
       - name: 3) 수익성/권리분석 컬럼 추가 (onbid_add_metrics.py)
+        continue-on-error: true
         run: python onbid_add_metrics.py
 
       - name: 신규 물건 요약 (Job Summary)
