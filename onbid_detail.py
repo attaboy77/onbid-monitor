@@ -30,6 +30,8 @@ onbid_collect2.py 로 수집해 둔 CSV(data/onbid_commercial_*.csv)를 읽어�
     data/onbid_commercial_detail_YYYY-MM-DD.csv
 """
 
+import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -43,12 +45,32 @@ from onbid_collect2 import SERVICE_KEY, HEADERS  # 기존 수집기의 인증키
 ENDPOINT = "https://apis.data.go.kr/B010003/OnbidRlstDtlSrvc2/getRlstDtlInf2"
 OUT_DIR = Path(__file__).parent / "data"
 
+# onbid_collect2.py 산출물(onbid_commercial_YYYY-MM-DD.csv)만 원본으로 인정한다.
+# _detail_/_norisk_ 파일까지 잡히면 상세 컬럼이 중복 병합돼 _x/_y 로 깨진다.
+SRC_NAME_RE = re.compile(r"onbid_commercial_\d{4}-\d{2}-\d{2}\.csv")
+
+DETAIL_COLUMNS = [
+    "면적상세", "전유면적", "임대차정보", "보증금액", "차임",
+    "전입일자", "확정일자", "등기현황", "등기권리종류",
+]
+
+
+def warn(msg):
+    """stderr 경고. GitHub Actions 에서는 워크플로 요약에 보이도록 annotation 으로 남긴다."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{msg}", flush=True)
+    else:
+        print(f"    ! {msg}", file=sys.stderr, flush=True)
+
 
 def fetch_detail(cltr_mng_no):
     """물건관리번호 하나에 대한 상세정보를 조회한다.
 
     같은 물건관리번호라도 회차별로 여러 건이 나올 수 있는데, 면적/임대차/등기
     정보는 회차와 무관하게 동일하므로 첫 번째 항목만 쓰면 된다.
+
+    반환값은 (item, 실패사유). 성공이면 실패사유가 None,
+    물건이 마감돼 조회되지 않으면 "NODATA", 그 밖의 실패는 사유 문자열.
     """
     params = {
         "serviceKey": SERVICE_KEY,
@@ -62,20 +84,25 @@ def fetch_detail(cltr_mng_no):
         r.raise_for_status()
         data = r.json()
     except (requests.RequestException, ValueError) as exc:
-        print(f"    ! {cltr_mng_no}: 요청 실패 ({exc})")
-        return None
+        # 예외 메시지의 URL에 인증키가 들어가므로 로그에 남기기 전에 가린다.
+        reason = re.sub(r"serviceKey=[^&\s]*", "serviceKey=<KEY>", str(exc))
+        return None, f"요청 실패 ({reason})"
 
-    header = data.get("header") or {}
-    if header.get("resultCode") != "00":
-        msg = header.get("resultMsg")
-        if msg != "NODATA_ERROR":
-            print(f"    ! {cltr_mng_no}: {msg}")
-        return None
+    # 정상 응답은 {"header": ...}, 오류 응답은 {"result": ...} 로 온다.
+    header = data.get("header") or data.get("result") or {}
+    code = header.get("resultCode")
+    msg = header.get("resultMsg")
+    if msg == "NODATA_ERROR":
+        return None, "NODATA"
+    if code != "00":
+        return None, f"API 오류 resultCode={code} resultMsg={msg} 응답={str(data)[:200]}"
 
-    items = (data.get("body") or {}).get("items", {}).get("item") or []
+    items = ((data.get("body") or {}).get("items") or {}).get("item") or []
     if isinstance(items, dict):
         items = [items]
-    return items[0] if items else None
+    if not items:
+        return None, "NODATA"
+    return items[0], None
 
 
 def fmt_amt(v):
@@ -169,12 +196,19 @@ def summarize_registry(rgst_list):
 
 def build_detail_columns(cltr_mng_nos):
     rows = []
+    nodata, errors = [], []
     total = len(cltr_mng_nos)
     for i, mng_no in enumerate(cltr_mng_nos, 1):
         print(f"  [{i}/{total}] {mng_no}")
-        item = fetch_detail(mng_no)
+        item, reason = fetch_detail(mng_no)
 
         if item is None:
+            if reason == "NODATA":
+                nodata.append(mng_no)
+                warn(f"{mng_no}: 상세정보 없음(NODATA, 낙찰/마감 추정)")
+            else:
+                errors.append(mng_no)
+                warn(f"{mng_no}: 상세조회 실패 - {reason}")
             rows.append({"물건관리번호": mng_no})
             time.sleep(0.25)
             continue
@@ -197,15 +231,17 @@ def build_detail_columns(cltr_mng_nos):
         })
         time.sleep(0.25)
 
-    return pd.DataFrame(rows)
+    # 전부 실패해도 컬럼 구성이 항상 같도록 맞춘다.
+    detail_df = pd.DataFrame(rows).reindex(columns=["물건관리번호"] + DETAIL_COLUMNS)
+    return detail_df, nodata, errors
 
 
 def main():
     if len(sys.argv) > 1:
         src_path = Path(sys.argv[1])
     else:
-        candidates = sorted(OUT_DIR.glob("onbid_commercial_*.csv"))
-        candidates = [p for p in candidates if "_detail" not in p.stem]
+        candidates = sorted(p for p in OUT_DIR.glob("onbid_commercial_*.csv")
+                            if SRC_NAME_RE.fullmatch(p.name))
         if not candidates:
             sys.exit("data/ 폴더에 onbid_commercial_*.csv 가 없습니다. 먼저 onbid_collect2.py 를 실행하세요.")
         src_path = candidates[-1]
@@ -214,18 +250,34 @@ def main():
     base = pd.read_csv(src_path, encoding="utf-8-sig", dtype={"물건관리번호": str})
     print(f"{len(base)}건 로드")
 
+    stale = [c for c in DETAIL_COLUMNS if c in base.columns]
+    if stale:
+        warn(f"원본 CSV에 이미 상세 컬럼이 있어 버리고 새로 조회합니다: {stale}")
+        base = base.drop(columns=stale)
+
     mng_nos = base["물건관리번호"].dropna().unique().tolist()
     print(f"\n상세조회 대상 물건관리번호 {len(mng_nos)}건")
 
-    detail_df = build_detail_columns(mng_nos)
+    if not mng_nos:
+        sys.exit("상세조회 대상 물건관리번호가 0건입니다. 원본 CSV를 확인하세요.")
+
+    detail_df, nodata, errors = build_detail_columns(mng_nos)
+    ok = len(mng_nos) - len(nodata) - len(errors)
+    print(f"\n상세조회 결과: 성공 {ok} / NODATA {len(nodata)} / 실패 {len(errors)} (총 {len(mng_nos)}건)")
+
+    # 성공이 0건이면 CSV를 만들지 않고 실패로 끝낸다. 다음 단계(add_metrics)가
+    # 상세 컬럼 없는 파일을 집어 들지 않도록 하기 위함이다.
+    if ok == 0:
+        sys.exit(f"상세조회 성공 0건 - 중단합니다. (NODATA {len(nodata)}, 실패 {len(errors)}) "
+                 "인증키(ONBID_KEY)와 API 상태를 확인하세요.")
+
     merged = base.merge(detail_df, on="물건관리번호", how="left")
 
     stamp = datetime.now().strftime("%Y-%m-%d")
     out_path = OUT_DIR / f"onbid_commercial_detail_{stamp}.csv"
     merged.to_csv(out_path, index=False, encoding="utf-8-sig")
 
-    ok = detail_df["면적상세"].notna().sum() if "면적상세" in detail_df else 0
-    print(f"\n{len(merged)}건을 {out_path} 에 저장했습니다. (상세조회 성공 {ok}/{len(mng_nos)}건)")
+    print(f"{len(merged)}건을 {out_path} 에 저장했습니다. (상세조회 성공 {ok}/{len(mng_nos)}건)")
 
 
 if __name__ == "__main__":
