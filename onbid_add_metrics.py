@@ -1,8 +1,9 @@
 """
-onbid_commercial_detail CSV에 수익성/권리분석 컬럼을 추가한다.
-================================================================
+onbid_{commercial,residential}_detail CSV에 수익성/권리분석 컬럼을 추가한다.
+==========================================================================
 
-onbid_detail.py 가 만든 data/onbid_commercial_detail_*.csv 를 읽어
+onbid_detail.py 가 만든 data/onbid_commercial_detail_*.csv (상가) 와
+data/onbid_residential_detail_*.csv (주택) 를 각각 읽어
 아래 컬럼을 새로 계산해서 같은 파일에 덮어쓴다. (구조화된 원본 API 응답을
 다시 부르지 않고, CSV에 이미 저장된 '임대차정보'/'등기현황' 텍스트 컬럼을
 다시 파싱해서 계산한다)
@@ -10,6 +11,7 @@ onbid_detail.py 가 만든 data/onbid_commercial_detail_*.csv 를 읽어
     전유평수          = 전유면적 / 3.3058
     평당필요월세      = 필요월세 / 전유평수                (기존엔 bldSqms 기반 '평수' 사용)
     1층환산 평당필요월세 = 평당필요월세 / 층별계수           (위 재계산값을 반영해 함께 갱신)
+                        주택은 층별계수가 비어 있어 이 값도 비어 있다.
 
     등기최선순위일자   = 등기현황 중 '위임기관'을 제외한 권리들의 설정일자 중 가장 빠른 날짜
                         (위임기관은 KAMCO가 압류재산을 위임받은 행정정보일 뿐 등기상
@@ -39,13 +41,14 @@ onbid_detail.py 가 만든 data/onbid_commercial_detail_*.csv 를 읽어
 
 산출물
 ------
-    (원본과 동일한 경로) 컬럼이 추가된 onbid_commercial_detail_*.csv
-    data/onbid_commercial_norisk_YYYY-MM-DD.csv
-        인수위험이 없는 물건만 모아 1층환산 평당필요월세 오름차순으로 정렬한 별도 CSV
+    (원본과 동일한 경로) 컬럼이 추가된 onbid_{slug}_detail_*.csv
+    data/onbid_{slug}_norisk_YYYY-MM-DD.csv   (날짜는 원본 detail 파일과 같다)
+        인수위험이 없는 물건만 모은 별도 CSV.
+        상가는 1층환산 평당필요월세, 주택은 평당필요월세 오름차순.
 
 실행
 ----
-    python onbid_add_metrics.py                                  최신 onbid_commercial_detail_*.csv
+    python onbid_add_metrics.py                     상가·주택 각각 최신 detail CSV
     python onbid_add_metrics.py data/onbid_commercial_detail_2026-09-09.csv
 """
 
@@ -58,6 +61,9 @@ import numpy as np
 import pandas as pd
 
 OUT_DIR = Path(__file__).parent / "data"
+
+SLUGS = ("commercial", "residential")   # 상가, 주택
+DETAIL_NAME_RE = re.compile(r"onbid_(commercial|residential)_detail_(\d{4}-\d{2}-\d{2})\.csv")
 
 PY_SQMS = 3.3058
 DATE_RE = re.compile(r"\d{8}")
@@ -136,14 +142,27 @@ def acquired_deposit_sum(entries, earliest_rgst_ymd):
 
 def main():
     if len(sys.argv) > 1:
-        src_path = Path(sys.argv[1])
+        sources = [Path(sys.argv[1])]
     else:
-        candidates = sorted(OUT_DIR.glob("onbid_commercial_detail_*.csv"))
-        if not candidates:
-            sys.exit("data/ 폴더에 onbid_commercial_detail_*.csv 가 없습니다. 먼저 onbid_detail.py 를 실행하세요.")
-        src_path = candidates[-1]
+        sources = []
+        for slug in SLUGS:
+            candidates = sorted(OUT_DIR.glob(f"onbid_{slug}_detail_*.csv"))
+            if candidates:
+                sources.append(candidates[-1])
+        if not sources:
+            sys.exit("data/ 폴더에 onbid_*_detail_*.csv 가 없습니다. 먼저 onbid_detail.py 를 실행하세요.")
 
-    print(f"대상 CSV: {src_path}")
+    for src_path in sources:
+        process(src_path)
+
+
+def process(src_path):
+    m = DETAIL_NAME_RE.fullmatch(src_path.name)
+    slug, stamp = (m.group(1), m.group(2)) if m else ("commercial", datetime.now().strftime("%Y-%m-%d"))
+    # 주택은 층별계수를 쓰지 않으므로 평당필요월세로 줄 세운다.
+    rank_col = "1층환산 평당필요월세" if slug == "commercial" else "평당필요월세"
+
+    print(f"\n대상 CSV: {src_path}")
     df = pd.read_csv(src_path, encoding="utf-8-sig")
     print(f"{len(df)}건 로드")
 
@@ -214,10 +233,9 @@ def main():
     print(f"  선순위임차인 인수 위험: {risk_n}건")
     print(f"  판정 - 적합 {ok_n}건 / 확인필요 {need_n}건 / 미달 {len(df) - ok_n - need_n}건")
 
-    # 9. 인수위험 없는 물건만 모아 1층환산 평당필요월세 오름차순으로 별도 CSV
-    safe = df[df["인수위험"] == ""].sort_values("1층환산 평당필요월세", ascending=True)
-    stamp = datetime.now().strftime("%Y-%m-%d")
-    safe_path = OUT_DIR / f"onbid_commercial_norisk_{stamp}.csv"
+    # 9. 인수위험 없는 물건만 모아 별도 CSV
+    safe = df[df["인수위험"] == ""].sort_values(rank_col, ascending=True)
+    safe_path = OUT_DIR / f"onbid_{slug}_norisk_{stamp}.csv"
     safe.to_csv(safe_path, index=False, encoding="utf-8-sig")
     print(f"  인수위험 없는 물건 {len(safe)}건을 {safe_path} 에 저장했습니다.")
 

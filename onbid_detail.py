@@ -2,7 +2,7 @@
 온비드 부동산 물건상세 조회 & 병합
 ====================================
 
-onbid_collect2.py 로 수집해 둔 CSV(data/onbid_commercial_*.csv)를 읽어서,
+onbid_collect2.py 로 수집해 둔 CSV(data/onbid_commercial_*.csv, data/onbid_residential_*.csv)를 읽어서,
 "차세대 온비드 부동산 물건상세 조회서비스"(OnbidRlstDtlSrvc2 / getRlstDtlInf2)를
 물건관리번호(cltrMngNo)별로 호출한 뒤 아래 정보를 CSV에 새 컬럼으로 합친다.
 
@@ -22,12 +22,13 @@ onbid_collect2.py 로 수집해 둔 CSV(data/onbid_commercial_*.csv)를 읽어�
 
 실행
 ----
-    python onbid_detail.py                       가장 최근 data/onbid_commercial_*.csv 사용
-    python onbid_detail.py data/onbid_commercial_2026-09-07.csv   특정 파일 지정
+    python onbid_detail.py                       상가·주택 각각 가장 최근 원본 CSV 사용
+    python onbid_detail.py data/onbid_commercial_2026-09-07.csv   특정 파일 하나만 처리
 
 산출물
 ------
     data/onbid_commercial_detail_YYYY-MM-DD.csv
+    data/onbid_residential_detail_YYYY-MM-DD.csv
 """
 
 import os
@@ -45,9 +46,11 @@ from onbid_collect2 import SERVICE_KEY, HEADERS  # 기존 수집기의 인증키
 ENDPOINT = "https://apis.data.go.kr/B010003/OnbidRlstDtlSrvc2/getRlstDtlInf2"
 OUT_DIR = Path(__file__).parent / "data"
 
-# onbid_collect2.py 산출물(onbid_commercial_YYYY-MM-DD.csv)만 원본으로 인정한다.
+SLUGS = ("commercial", "residential")   # 상가, 주택
+
+# onbid_collect2.py 산출물(onbid_{slug}_YYYY-MM-DD.csv)만 원본으로 인정한다.
 # _detail_/_norisk_ 파일까지 잡히면 상세 컬럼이 중복 병합돼 _x/_y 로 깨진다.
-SRC_NAME_RE = re.compile(r"onbid_commercial_\d{4}-\d{2}-\d{2}\.csv")
+SRC_NAME_RE = re.compile(r"onbid_(commercial|residential)_(\d{4}-\d{2}-\d{2})\.csv")
 
 DETAIL_COLUMNS = [
     "면적상세", "전유면적", "임대차정보", "보증금액", "차임",
@@ -236,17 +239,20 @@ def build_detail_columns(cltr_mng_nos):
     return detail_df, nodata, errors
 
 
-def main():
-    if len(sys.argv) > 1:
-        src_path = Path(sys.argv[1])
-    else:
-        candidates = sorted(p for p in OUT_DIR.glob("onbid_commercial_*.csv")
-                            if SRC_NAME_RE.fullmatch(p.name))
-        if not candidates:
-            sys.exit("data/ 폴더에 onbid_commercial_*.csv 가 없습니다. 먼저 onbid_collect2.py 를 실행하세요.")
-        src_path = candidates[-1]
+def latest_source(slug):
+    candidates = sorted(
+        p for p in OUT_DIR.glob(f"onbid_{slug}_*.csv")
+        if (m := SRC_NAME_RE.fullmatch(p.name)) and m.group(1) == slug
+    )
+    return candidates[-1] if candidates else None
 
-    print(f"원본 CSV: {src_path}")
+
+def process(src_path):
+    """원본 CSV 하나에 상세정보를 붙여 저장한다. 상세조회 성공 건수를 돌려준다 (대상 없으면 None)."""
+    m = SRC_NAME_RE.fullmatch(src_path.name)
+    slug = m.group(1) if m else "commercial"
+
+    print(f"\n원본 CSV: {src_path}")
     base = pd.read_csv(src_path, encoding="utf-8-sig", dtype={"물건관리번호": str})
     print(f"{len(base)}건 로드")
 
@@ -256,28 +262,47 @@ def main():
         base = base.drop(columns=stale)
 
     mng_nos = base["물건관리번호"].dropna().unique().tolist()
-    print(f"\n상세조회 대상 물건관리번호 {len(mng_nos)}건")
-
+    print(f"상세조회 대상 물건관리번호 {len(mng_nos)}건")
     if not mng_nos:
-        sys.exit("상세조회 대상 물건관리번호가 0건입니다. 원본 CSV를 확인하세요.")
+        warn(f"{src_path.name}: 상세조회 대상이 0건입니다.")
+        return None
 
     detail_df, nodata, errors = build_detail_columns(mng_nos)
     ok = len(mng_nos) - len(nodata) - len(errors)
-    print(f"\n상세조회 결과: 성공 {ok} / NODATA {len(nodata)} / 실패 {len(errors)} (총 {len(mng_nos)}건)")
+    print(f"상세조회 결과: 성공 {ok} / NODATA {len(nodata)} / 실패 {len(errors)} (총 {len(mng_nos)}건)")
 
-    # 성공이 0건이면 CSV를 만들지 않고 실패로 끝낸다. 다음 단계(add_metrics)가
+    # 성공이 0건이면 CSV를 만들지 않는다. 다음 단계(add_metrics)가
     # 상세 컬럼 없는 파일을 집어 들지 않도록 하기 위함이다.
     if ok == 0:
-        sys.exit(f"상세조회 성공 0건 - 중단합니다. (NODATA {len(nodata)}, 실패 {len(errors)}) "
-                 "인증키(ONBID_KEY)와 API 상태를 확인하세요.")
+        warn(f"{src_path.name}: 상세조회 성공 0건 - 상세 CSV를 만들지 않습니다. "
+             f"(NODATA {len(nodata)}, 실패 {len(errors)})")
+        return 0
 
     merged = base.merge(detail_df, on="물건관리번호", how="left")
 
     stamp = datetime.now().strftime("%Y-%m-%d")
-    out_path = OUT_DIR / f"onbid_commercial_detail_{stamp}.csv"
+    out_path = OUT_DIR / f"onbid_{slug}_detail_{stamp}.csv"
     merged.to_csv(out_path, index=False, encoding="utf-8-sig")
 
     print(f"{len(merged)}건을 {out_path} 에 저장했습니다. (상세조회 성공 {ok}/{len(mng_nos)}건)")
+    return ok
+
+
+def main():
+    if len(sys.argv) > 1:
+        sources = [Path(sys.argv[1])]
+    else:
+        sources = [p for p in (latest_source(slug) for slug in SLUGS) if p]
+        if not sources:
+            sys.exit("data/ 폴더에 onbid_commercial_*.csv / onbid_residential_*.csv 가 없습니다. "
+                     "먼저 onbid_collect2.py 를 실행하세요.")
+
+    results = [process(p) for p in sources]
+
+    # 대상이 있었는데 한 건도 성공하지 못했다면 인증키나 API 문제일 가능성이 크므로 실패로 끝낸다.
+    attempted = [r for r in results if r is not None]
+    if attempted and sum(attempted) == 0:
+        sys.exit("상세조회 성공 0건 - 중단합니다. 인증키(ONBID_KEY)와 API 상태를 확인하세요.")
 
 
 if __name__ == "__main__":

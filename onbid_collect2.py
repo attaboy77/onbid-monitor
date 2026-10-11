@@ -1,9 +1,10 @@
 """
-온비드 공매 상가 수집기 (차세대 API)
-====================================
+온비드 공매 상가·주택 수집기 (차세대 API)
+=========================================
 
-서울 + 고양시의 상가용/업무용 압류재산 공매 물건을 수집하고,
-목표수익률을 맞추려면 월세가 얼마여야 하는지를 역산해서 CSV로 저장한다.
+서울 + 고양시의 압류재산 공매 물건 중 상가(상가용및업무용)와 주택(아파트·연립·다세대·단독·다가구)을
+수집하고, 목표수익률을 맞추려면 월세가 얼마여야 하는지를 역산해서 구분별 CSV로 저장한다.
+API는 용도를 요청 조건으로 받지 못하므로 한 번에 받아서 CATEGORIES 기준으로 나눈다.
 
 준비
 ----
@@ -21,8 +22,10 @@
 
 산출물
 ------
-    data/onbid_commercial_YYYY-MM-DD.csv   전체 수집분
-    data/latest.json                       다음 실행 때 신규 판별용
+    data/onbid_commercial_YYYY-MM-DD.csv    상가 (onbid_detail.py 이후 단계의 입력)
+    data/onbid_residential_YYYY-MM-DD.csv   주택
+    data/latest.json                        상가 신규 판별용
+    data/onbid_residential_latest.json      주택 신규 판별용
 """
 
 import json
@@ -79,12 +82,38 @@ TARGETS = [
 ]
 
 PRPT_DIV_CD = "0007"        # 압류재산
-USAGE_MCLS = "10300"        # 상가용및업무용건물 (요청에는 못 쓰고 수신 후 필터로 사용)
 PVCT_TRGT_YN = "N"          # 수의계약가능여부. 필수 파라미터다
 DISPOSAL_SALE = "0001"      # 매각 (임대 제외)
 
-MIN_APPRAISAL = 200_000_000    # 감정가 하한 2억
-MAX_APPRAISAL = 500_000_000    # 감정가 상한 5억
+# 구분별 조건. 용도코드는 요청에는 못 쓰고 수신 후 필터로 사용한다.
+# 공매는 최저가 필드를 쓸 수 없어 가격 조건은 감정가 기준이다.
+CATEGORIES = [
+    {
+        "구분": "상가",
+        "slug": "commercial",
+        "mcls": "10300",            # 상가용및업무용건물
+        "scls": None,               # 소분류 전체
+        "min_appraisal": 200_000_000,
+        "max_appraisal": 500_000_000,
+        "acq_tax_rate": 0.046,      # 상가 취득세 4.6%
+        "floor_coef": True,
+        "latest": "latest.json",    # 기존 파일명 유지
+    },
+    {
+        "구분": "주택",
+        "slug": "residential",
+        "mcls": "10200",            # 주거용건물
+        # 아파트, 단독주택, 다가구주택, 다세대주택, 연립주택
+        # (도시형생활주택 10208, 기타주거용건물 10219, 오피스텔 10503 은 제외)
+        "scls": {"10201", "10204", "10205", "10206", "10209"},
+        "min_appraisal": 0,
+        "max_appraisal": 100_000_000,
+        "acq_tax_rate": 0.011,      # 주택 취득세 1.1%
+        "floor_coef": False,        # 주택은 층별 임대료 차이가 작아 층별계수를 쓰지 않는다
+        "latest": "onbid_residential_latest.json",
+    },
+]
+
 MIN_PY = 10.0                  # 평수 하한 10평. 쇼핑몰 초소형 점포 제외
 EXCLUDE_SHARE = True            # 지분물건 제외
 FAILED_BID_WARN = 5             # 유찰횟수 경고 기준 (이상이면 경고 표시)
@@ -98,7 +127,8 @@ FLOOR_COEF_BASEMENT = 0.45
 # --- 수익률 역산 가정 ---------------------------------------------------------
 TARGET_YIELD = 0.06          # 목표 수익률
 ASSUMED_WIN_RATE = 0.70      # 낙찰가 / 감정가 가정치
-ACQ_TAX_RATE = 0.046         # 상가 취득세 4.6%
+MIN_PRICE_MARKUP = 1.05      # 경매: 최저매각가 대비 낙찰가 가정치 (최저가보다 조금 높게 낙찰)
+ACQ_TAX_RATE = 0.046         # 기본 취득세 (상가 4.6%). 주택은 CATEGORIES 에서 1.1%
 LEGAL_FEE = 1_500_000        # 법무비·등기비
 EVICTION_COST = 10_000_000   # 명도비. 공매는 인도명령이 없어 넉넉히 잡는다
 VACANCY_RATE = 0.10          # 공실률
@@ -210,13 +240,24 @@ def floor_coefficient(floor, is_basement):
     return FLOOR_COEF.get(floor, FLOOR_COEF_HIGH)
 
 
-def required_monthly_rent(appraisal):
-    """목표수익률을 맞추기 위해 필요한 월세를 역산한다."""
-    if not appraisal:
+def assumed_bid_price(appraisal, min_price=None):
+    """가정낙찰가. 기본은 감정가 × 가정낙찰률.
+
+    최저매각가를 알 수 있는 경매는 유찰이 거듭되면 감정가 × 70% 보다 훨씬 낮게 낙찰되므로
+    max(최저매각가 × 1.05, 감정가 × 70%) 로 잡는다. 실제 낙찰가는 최저가보다 조금 높게 형성된다.
+    """
+    bid = appraisal * ASSUMED_WIN_RATE
+    if min_price and not pd.isna(min_price):
+        bid = max(min_price * MIN_PRICE_MARKUP, bid)
+    return bid
+
+
+def required_monthly_rent(bid_price, acq_tax_rate=ACQ_TAX_RATE):
+    """가정낙찰가에서 목표수익률을 맞추기 위해 필요한 월세를 역산한다."""
+    if not bid_price:
         return None
 
-    bid_price = appraisal * ASSUMED_WIN_RATE
-    total_cost = bid_price * (1 + ACQ_TAX_RATE) + LEGAL_FEE + EVICTION_COST
+    total_cost = bid_price * (1 + acq_tax_rate) + LEGAL_FEE + EVICTION_COST
 
     # 보증금은 물건마다 달라 알 수 없으므로 0으로 둔다. 보수적인 방향이다.
     required_net = total_cost * TARGET_YIELD
@@ -225,7 +266,37 @@ def required_monthly_rent(appraisal):
     return round(required_gross / 12)
 
 
-def build_dataframe(raw_rows):
+def add_rent_columns(df, appraisal_col, category, min_price_col=None):
+    """가정낙찰가·필요월세·평당필요월세와 (상가만) 층별 환산 컬럼을 채운다. 법원경매 수집기도 같이 쓴다.
+
+    min_price_col 을 주면 (경매) 가정낙찰가에 최저매각가를 반영한다.
+    """
+    min_prices = df[min_price_col] if min_price_col else [None] * len(df)
+    bids = pd.Series(
+        [assumed_bid_price(a, m) for a, m in zip(df[appraisal_col], min_prices)],
+        index=df.index,
+    )
+    df["가정낙찰가"] = bids.round(-4)
+    df["필요월세"] = bids.map(lambda b: required_monthly_rent(b, category["acq_tax_rate"]))
+    df["평당필요월세"] = (df["필요월세"] / df["평수"]).round(-2)
+
+    if category["floor_coef"]:
+        df["층별계수"] = [
+            floor_coefficient(f, b) for f, b in zip(df["층"], df["지하여부"])
+        ]
+        df["1층환산 평당필요월세"] = (df["평당필요월세"] / df["층별계수"]).round(-2)
+    else:
+        # 컬럼은 남겨 두어 상가 CSV와 구조를 맞춘다.
+        df["층별계수"] = None
+        df["1층환산 평당필요월세"] = None
+
+
+def sort_column(category):
+    return "1층환산 평당필요월세" if category["floor_coef"] else "평당필요월세"
+
+
+def prepare_dataframe(raw_rows):
+    """구분과 상관없는 공통 정리: 숫자 변환, 회차 중복 제거, 매각만, 지분 제외."""
     df = pd.DataFrame(raw_rows)
     if df.empty:
         return df
@@ -248,12 +319,6 @@ def build_dataframe(raw_rows):
         print(f"  회차 중복 제거 (물건관리번호별 최빠른 입찰시작일만): {before} → {len(df)}")
 
     before = len(df)
-
-    if "cltrUsgMclsCtgrId" in df.columns:
-        df = df[df["cltrUsgMclsCtgrId"].astype(str) == USAGE_MCLS]
-        print(f"  상가용및업무용건물만: {before} → {len(df)}")
-
-    before = len(df)
     if "dspsMthodNm" in df.columns:
         df = df[df["dspsMthodNm"] == "매각"]
         print(f"  매각 물건만 (임대 제외): {before} → {len(df)}")
@@ -263,17 +328,32 @@ def build_dataframe(raw_rows):
         df = df[df["alcYn"] != "Y"]
         print(f"  지분물건 제외: {before} → {len(df)}")
 
+    return df
+
+
+def build_dataframe(df, category):
+    """공통 정리를 마친 df 에서 한 구분(상가/주택)을 골라 필요월세 등을 계산한다."""
+    label = category["구분"]
+    print(f"\n[{label}]")
+
     before = len(df)
-    df = df[df["apslEvlAmt"].fillna(0).between(MIN_APPRAISAL, MAX_APPRAISAL)]
-    print(f"  감정가 {MIN_APPRAISAL:,}~{MAX_APPRAISAL:,}원: {before} → {len(df)}")
+    df = df[df["cltrUsgMclsCtgrId"].astype(str) == category["mcls"]]
+    if category["scls"]:
+        df = df[df["cltrUsgSclsCtgrId"].astype(str).isin(category["scls"])]
+    print(f"  {label} 용도만: {before} → {len(df)}")
+
+    lo, hi = category["min_appraisal"], category["max_appraisal"]
+    before = len(df)
+    df = df[df["apslEvlAmt"].fillna(0).between(lo, hi)]
+    print(f"  감정가 {lo:,}~{hi:,}원: {before} → {len(df)}")
 
     if df.empty:
         return df
 
-    df["평수"] = (df["bldSqms"] / 3.3058).round(1)
+    df = df.assign(구분=label, 평수=(df["bldSqms"] / 3.3058).round(1))
 
     before = len(df)
-    df = df[df["평수"].fillna(0) >= MIN_PY]
+    df = df[df["평수"].fillna(0) >= MIN_PY].copy()
     print(f"  평수 {MIN_PY}평 이상: {before} → {len(df)}")
 
     if df.empty:
@@ -284,14 +364,7 @@ def build_dataframe(raw_rows):
         df["층"] = floor_info.map(lambda t: t[0])
         df["지하여부"] = floor_info.map(lambda t: t[1])
 
-    df["가정낙찰가"] = (df["apslEvlAmt"] * ASSUMED_WIN_RATE).round(-4)
-    df["필요월세"] = df["apslEvlAmt"].map(required_monthly_rent)
-    df["평당필요월세"] = (df["필요월세"] / df["평수"]).round(-2)
-
-    df["층별계수"] = [
-        floor_coefficient(f, b) for f, b in zip(df["층"], df["지하여부"])
-    ]
-    df["1층환산 평당필요월세"] = (df["평당필요월세"] / df["층별계수"]).round(-2)
+    add_rent_columns(df, "apslEvlAmt", category)
 
     def warn_label(n):
         if n >= FAILED_BID_STRONG_WARN:
@@ -310,6 +383,7 @@ def build_dataframe(raw_rows):
 
 
 KEEP_COLUMNS = [
+    "구분",
     "cltrMngNo", "onbidCltrNm", "층", "지하여부", "cltrUsgSclsCtgrNm",
     "lctnSdnm", "lctnSggnm", "lctnEmdNm",
     "apslEvlAmt", "가정낙찰가", "필요월세", "평당필요월세",
@@ -333,6 +407,63 @@ RENAMES = {
     "dtbtRqrEdtmCont": "배분요구종기",
     "pbctStatNm": "상태", "ltnoPnu": "PNU", "mdfcnDt": "최종수정",
 }
+
+# 저장되는 CSV의 공통 컬럼 (한글 이름). 법원경매 수집기도 이 순서를 따른다.
+OUTPUT_COLUMNS = [RENAMES.get(c, c) for c in KEEP_COLUMNS] + ["신규"]
+
+
+def _fmt(value):
+    return "" if pd.isna(value) else f"{value:,.0f}"
+
+
+def output_path(category, prefix):
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    return OUT_DIR / f"{prefix}_{category['slug']}_{stamp}.csv"
+
+
+def save_empty(category, prefix):
+    """조건을 통과한 물건이 없어도 헤더만 있는 CSV를 남긴다.
+
+    파일이 없으면 다음 단계(상세조회·텔레그램)가 며칠 전 파일을 오늘 것으로 오인할 수 있다.
+    신규 판별용 latest 파일은 건드리지 않는다.
+    """
+    path = output_path(category, prefix)
+    pd.DataFrame(columns=OUTPUT_COLUMNS).to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"[{category['구분']}] 조건을 통과한 물건이 없습니다. 빈 CSV를 {path} 에 저장했습니다.")
+
+
+def save_output(out, category, prefix, latest_name, preview_cols):
+    """신규 표시를 붙이고 정렬해서 data/{prefix}_{slug}_YYYY-MM-DD.csv 로 저장한다.
+
+    out 은 OUTPUT_COLUMNS 중 '신규'를 뺀 컬럼(+출처별 추가 컬럼)을 가진 DataFrame 이다.
+    """
+    prev_path = OUT_DIR / latest_name
+    previous = set()
+    if prev_path.exists():
+        previous = set(json.loads(prev_path.read_text(encoding="utf-8")))
+
+    ids = out["물건관리번호"].astype(str)
+    out = out.copy()
+    out["신규"] = ids.map(lambda x: "Y" if previous and x not in previous else "")
+    prev_path.write_text(json.dumps(sorted(set(ids)), ensure_ascii=False), encoding="utf-8")
+
+    extras = [c for c in out.columns if c not in OUTPUT_COLUMNS]
+    out = out[OUTPUT_COLUMNS + extras].sort_values(sort_column(category), ascending=True)
+
+    path = output_path(category, prefix)
+    out.to_csv(path, index=False, encoding="utf-8-sig")
+
+    print(f"\n[{category['구분']}] {len(out)}건을 {path} 에 저장했습니다.")
+    if previous:
+        print(f"이 중 신규 {(out['신규'] == 'Y').sum()}건")
+
+    cols = [c for c in preview_cols if category["floor_coef"] or c not in ("층별계수", "1층환산 평당필요월세")]
+    preview = out[cols].head(15).copy()
+    for col in ("감정가", "최저매각가", "필요월세", "평당필요월세", "1층환산 평당필요월세"):
+        if col in preview.columns:
+            preview[col] = preview[col].map(_fmt)
+    print("--- 미리보기 ---")
+    print(preview.to_string(index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -358,42 +489,21 @@ def main():
     if not raw:
         return
 
-    df = build_dataframe(raw)
-    if df.empty:
-        print("조건을 통과한 물건이 없습니다.")
-        return
+    base = prepare_dataframe(raw)
 
-    # 신규 물건 판별
-    prev_path = OUT_DIR / "latest.json"
-    previous = set()
-    if prev_path.exists():
-        previous = set(json.loads(prev_path.read_text(encoding="utf-8")))
+    for category in CATEGORIES:
+        df = build_dataframe(base, category)
+        if df.empty:
+            save_empty(category, "onbid")
+            continue
 
-    current = set(df["cltrMngNo"].astype(str))
-    df["신규"] = df["cltrMngNo"].astype(str).map(lambda x: "Y" if x not in previous and previous else "")
-    prev_path.write_text(json.dumps(sorted(current), ensure_ascii=False), encoding="utf-8")
-
-    cols = [c for c in KEEP_COLUMNS if c in df.columns] + ["신규"]
-    out = df[cols].rename(columns=RENAMES).sort_values("1층환산 평당필요월세", ascending=True)
-
-    stamp = datetime.now().strftime("%Y-%m-%d")
-    path = OUT_DIR / f"onbid_commercial_{stamp}.csv"
-    out.to_csv(path, index=False, encoding="utf-8-sig")
-
-    print(f"\n{len(out)}건을 {path} 에 저장했습니다.")
-    if previous:
-        print(f"이 중 신규 {(out['신규'] == 'Y').sum()}건")
-
-    preview = out[
-        ["물건명", "층", "지하여부", "용도", "감정가", "필요월세", "평수",
-         "평당필요월세", "층별계수", "1층환산 평당필요월세", "경고"]
-    ].head(15).copy()
-    preview["감정가"] = preview["감정가"].map("{:,.0f}".format)
-    preview["필요월세"] = preview["필요월세"].map("{:,.0f}".format)
-    preview["평당필요월세"] = preview["평당필요월세"].map("{:,.0f}".format)
-    preview["1층환산 평당필요월세"] = preview["1층환산 평당필요월세"].map("{:,.0f}".format)
-    print("\n--- 미리보기 ---")
-    print(preview.to_string(index=False))
+        cols = [c for c in KEEP_COLUMNS if c in df.columns]
+        out = df[cols].rename(columns=RENAMES)
+        save_output(
+            out, category, "onbid", category["latest"],
+            ["물건명", "층", "지하여부", "용도", "감정가", "필요월세", "평수",
+             "평당필요월세", "층별계수", "1층환산 평당필요월세", "경고"],
+        )
 
 
 if __name__ == "__main__":
