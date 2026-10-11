@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
   group: onbid-daily
@@ -70,3 +72,23 @@ jobs:
             git commit -m "chore: 경매·공매 데이터 자동 수집 $(date -u +'%Y-%m-%d')"
             git push
           fi
+
+      - name: 웹페이지 생성 (build_site.py)
+        run: python build_site.py
+
+      - name: Pages 산출물 업로드
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    # 수집 데이터 커밋이 끝난 뒤에 배포한다. 저장소 Settings > Pages > Source 를 'GitHub Actions' 로 둬야 한다.
+    needs: collect
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: GitHub Pages 배포
+        id: deployment
+        uses: actions/deploy-pages@v4
