@@ -45,6 +45,14 @@ jobs:
       - name: 신규 물건 요약 (Job Summary)
         run: python onbid_summary.py >> "$GITHUB_STEP_SUMMARY"
 
+      - name: 텔레그램 알림 (onbid_telegram.py)
+        # 스크립트도 전송 실패 시 exit 0 이지만, 예기치 못한 오류까지 막기 위해 한 번 더 건다.
+        continue-on-error: true
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python onbid_telegram.py
+
       - name: 결과 커밋 & 푸시
         run: |
           git config user.name "github-actions[bot]"
