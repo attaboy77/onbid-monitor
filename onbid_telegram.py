@@ -36,6 +36,7 @@ import html
 import os
 import re
 import sys
+from urllib.parse import quote
 from pathlib import Path
 
 import pandas as pd
@@ -76,6 +77,14 @@ INHERIT_RISK_WORDS = ("선순위", "대항력", "유치권", "법정지상권")
 # 넣으면 되는 경매사건검색 화면으로 보내고, 사건번호 숫자를 복사하기 쉽게 따로 보여준다.
 COURT_CASE_SEARCH_URL = "https://www.courtauction.go.kr/pgj/index.on?w2xPath=/pgj/ui/pgj100/PGJ159M00.xml"
 CASE_NO_RE = re.compile(r"(\d{4})(\D+)(\d+)")
+
+# 카카오맵 주소 검색. 로드뷰로 바로 여는 /link/roadview/위도,경도 는 좌표가 있어야 하는데
+# 좌표를 구하려면 카카오 REST API 키가 필요해서, 검색 결과(주소 위치)로 보내고 거기서 로드뷰를 누르게 한다.
+KAKAO_MAP_SEARCH_URL = "https://map.kakao.com/link/search/"
+# 물건명에서 주소의 끝이 되는 토큰: 지번(산12-3) 또는 도로명 건물번호(18-30).
+ADDR_NO_RE = re.compile(r"산?\d+(-\d+)?")
+# 그 바로 앞 토큰이 법정동·리(…동, …가, …리) 또는 도로명(…로, …길)이어야 주소로 본다.
+ADDR_PREV_RE = re.compile(r"(동|가|리|로|길)$")
 
 STAMP_RE = re.compile(r"(?:onbid|court)_(?:commercial|residential)_(\d{4}-\d{2}-\d{2})\.csv")
 
@@ -209,6 +218,24 @@ def item_link(row):
     return COURT_CASE_SEARCH_URL if row.get("출처") == "경매" else ""
 
 
+def map_address(row):
+    """물건명 앞부분에서 지도 검색용 주소를 뽑는다. 못 뽑으면 빈 문자열.
+
+    '서울특별시 금천구 시흥동 169-45 프라우드빌 제3층 제302호' → '서울특별시 금천구 시흥동 169-45'
+    '서울특별시 중구 마장로1길 21 지하1층16호 (신당동,광희시장)' → '서울특별시 중구 마장로1길 21'
+    """
+    tokens = str(row.get("물건명") or "").split()
+    for i in range(2, len(tokens)):
+        if ADDR_NO_RE.fullmatch(tokens[i]) and ADDR_PREV_RE.search(tokens[i - 1]):
+            return " ".join(tokens[: i + 1])
+    return ""
+
+
+def map_link(row):
+    addr = map_address(row)
+    return KAKAO_MAP_SEARCH_URL + quote(addr) if addr else ""
+
+
 def court_case(row):
     """경매 사건 표기를 (법원, 연도+사건구분, 사건 일련번호, 물건번호) 로 나눈다.
 
@@ -238,7 +265,11 @@ def format_item(rank, row, rank_label, rank_col):
     link = item_link(row)
     if link:
         name = f'<a href="{html.escape(link, quote=True)}">{name}</a>'
-    lines = [f"{rank}. [{source}] {name}{new}"]
+    first = f"{rank}. [{source}] {name}{new}"
+    kakao = map_link(row)
+    if kakao:
+        first += f' · <a href="{html.escape(kakao, quote=True)}">🗺 지도</a>'
+    lines = [first]
 
     failed = row.get("유찰횟수")
     failed = 0 if is_missing(failed) else int(failed)
@@ -295,15 +326,24 @@ def build_message(stamp):
 # 전송
 # ---------------------------------------------------------------------------
 
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def visible_len(text):
+    """텔레그램이 세는 길이. 한도는 태그를 해석한 뒤의 글자 수라 링크 URL 은 들어가지 않는다."""
+    return len(html.unescape(TAG_RE.sub("", text)))
+
+
 def truncate(text, limit=TG_MAX_LEN):
     """텔레그램 길이 제한을 넘으면 줄 단위로 잘라낸다."""
-    if len(text) <= limit:
+    if visible_len(text) <= limit:
         return text
     suffix = "\n… (길이 제한으로 생략)"
-    cut = text[: limit - len(suffix)]
-    # 태그가 중간에 잘려 HTML 파싱 오류가 나지 않도록 마지막 완결된 줄까지만 남긴다.
-    cut = cut[: cut.rfind("\n")]
-    return cut + suffix
+    # 태그가 중간에 잘려 HTML 파싱 오류가 나지 않도록 완결된 줄 단위로 뒤에서부터 뺀다.
+    lines = text.split("\n")
+    while lines and visible_len("\n".join(lines) + suffix) > limit:
+        lines.pop()
+    return "\n".join(lines) + suffix
 
 
 def send(token, chat_id, text):
