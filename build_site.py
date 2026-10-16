@@ -9,8 +9,9 @@ site/index.html 한 장으로 만든다. 데이터는 HTML 안에 JSON으로 박
     - 상가/주택 탭, 출처(전체/공매/경매) 필터, 인수위험 제외 토글, 검색
     - 컬럼 머리글 클릭으로 정렬 (휴대폰에서는 카드 보기 + 정렬 드롭다운)
     - 인수위험 물건은 붉은 배경으로 표시 (판정 기준은 onbid_telegram.load_section 과 같다)
-    - 물건명에 링크: 공매는 온비드 물건 상세, 경매는 법원경매 물건상세검색 화면
-      (법원경매는 물건별 고정 주소가 없어서 검색 화면으로 보내고 사건번호를 함께 보여준다)
+    - 물건명에 링크: 공매는 온비드 물건 상세, 경매는 법원경매 경매사건검색 화면
+      (법원경매는 물건별 고정 주소가 없다. onbid_telegram.COURT_CASE_SEARCH_URL 참고.
+       대신 사건번호 옆 '번호 복사' 버튼으로 검색창에 넣을 일련번호를 복사한다)
 
 실행
 ----
@@ -26,10 +27,12 @@ import pandas as pd
 
 from onbid_telegram import (
     SECTIONS,
+    court_case,
     fmt_floor,
     fmt_man,
     fmt_price,
     is_missing,
+    item_link,
     latest_stamp,
     load_section,
     risk_notes,
@@ -42,7 +45,6 @@ except (AttributeError, ValueError):
     pass
 
 SITE_DIR = Path(__file__).parent / "site"
-COURT_SEARCH_URL = "https://www.courtauction.go.kr/pgj/index.on?w2xPath=/pgj/ui/pgj100/PGJ151F00.xml"
 
 
 def num(v):
@@ -69,13 +71,10 @@ def fmt_date(v):
 def to_record(row):
     source = row["출처"]
     court = source == "경매"
-    case = ""
+    case, case_no = "", ""
     if court:
-        case = f"{row.get('법원', '')} {row.get('사건번호', '')}-{int(row.get('물건번호'))}".strip()
-
-    link = row.get("온비드링크")
-    if not (isinstance(link, str) and link.startswith("http")):
-        link = COURT_SEARCH_URL if court else ""
+        court_nm, head, case_no, ser = court_case(row)
+        case = f"{court_nm} {head}{case_no}-{ser}".strip()
 
     if court:
         risk = risk_notes(row)
@@ -92,8 +91,9 @@ def to_record(row):
         "src": source,
         "name": short_name(row),
         "full": str(row.get("물건명") or ""),
-        "link": link,
+        "link": item_link(row),
         "case": case,
+        "caseNo": case_no,
         "region": region,
         "use": "" if is_missing(row.get("용도")) else str(row.get("용도")),
         "floor": fmt_floor(row),
@@ -208,6 +208,8 @@ td.name { white-space: normal; min-width: 220px; max-width: 340px; }
 td.name a { color: var(--accent); font-weight: 600; text-decoration: none; }
 td.name a:hover { text-decoration: underline; }
 .full, .case { display: block; color: var(--muted); font-size: 12px; }
+.copy { font: inherit; font-size: 11px; padding: 0 6px; margin-left: 4px; cursor: pointer;
+  color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 4px; }
 tr.risk td { background: var(--risk-bg); }
 tr.risk td:first-child { box-shadow: inset 3px 0 var(--risk-text); }
 .risktxt { color: var(--risk-text); font-weight: 600; white-space: normal; }
@@ -314,7 +316,8 @@ function cell(c, it) {
       return `<td class="name"><span class="badge b-${esc(it.src)}">${esc(it.src)}</span>${title}` +
         (it.new ? `<span class="new">NEW</span>` : "") +
         `<span class="full">${esc(it.full)}</span>` +
-        (it.case ? `<span class="case">${esc(it.case)} · 검색 화면에서 사건번호로 조회</span>` : "") + `</td>`;
+        (it.case ? `<span class="case">${esc(it.case)} ` +
+          `<button type="button" class="copy" data-copy="${esc(it.caseNo)}">번호 복사</button></span>` : "") + `</td>`;
     }
     case "src": return `<td class="hideM">${esc(it.src)}</td>`;
     case "floorN": return `<td class="n">${k}${esc(it.floor)}</td>`;
@@ -392,6 +395,14 @@ $("srcSeg").addEventListener("click", (e) => {
 $("hideRisk").addEventListener("change", (e) => { state.hideRisk = e.target.checked; renderBody(); });
 $("onlyNew").addEventListener("change", (e) => { state.onlyNew = e.target.checked; renderBody(); });
 $("q").addEventListener("input", (e) => { state.q = e.target.value; renderBody(); });
+// 경매사건검색 화면의 사건번호 입력칸에 붙여 넣을 일련번호를 복사한다.
+$("body").addEventListener("click", (e) => {
+  const b = e.target.closest(".copy");
+  if (!b) return;
+  const done = () => { b.textContent = "복사됨"; setTimeout(() => { b.textContent = "번호 복사"; }, 1500); };
+  if (navigator.clipboard) navigator.clipboard.writeText(b.dataset.copy).then(done, () => prompt("사건번호", b.dataset.copy));
+  else prompt("사건번호", b.dataset.copy);
+});
 
 setTab(0);
 </script>
