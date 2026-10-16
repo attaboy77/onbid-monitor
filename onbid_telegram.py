@@ -70,6 +70,13 @@ SECTIONS = [
 # 경매 '경고' 중 낙찰자가 떠안을 수 있는 권리. 이 단어가 있으면 TOP 에서 뺀다.
 INHERIT_RISK_WORDS = ("선순위", "대항력", "유치권", "법정지상권")
 
+# 법원경매 물건으로 바로 가는 주소는 없다 (2026-10 확인). 물건 상세는 검색 결과를 클릭했을 때
+# 화면 안에서만 WebSquare 파라미터로 열리고, 다른 화면에서 넘어올 때도 courtauction.go.kr 의
+# localStorage('dtlSrchParam')로 조건을 넘겨서 URL 에는 아무것도 남지 않는다. 그래서 법원·사건번호만
+# 넣으면 되는 경매사건검색 화면으로 보내고, 사건번호 숫자를 복사하기 쉽게 따로 보여준다.
+COURT_CASE_SEARCH_URL = "https://www.courtauction.go.kr/pgj/index.on?w2xPath=/pgj/ui/pgj100/PGJ159M00.xml"
+CASE_NO_RE = re.compile(r"(\d{4})(\D+)(\d+)")
+
 STAMP_RE = re.compile(r"(?:onbid|court)_(?:commercial|residential)_(\d{4}-\d{2}-\d{2})\.csv")
 
 
@@ -194,6 +201,27 @@ def fmt_floor(row):
     return f"{int(floor)}층"
 
 
+def item_link(row):
+    """물건명에 걸 주소. 공매는 온비드 물건 상세, 경매는 경매사건검색 화면."""
+    link = row.get("온비드링크")
+    if isinstance(link, str) and link.startswith("http"):
+        return link
+    return COURT_CASE_SEARCH_URL if row.get("출처") == "경매" else ""
+
+
+def court_case(row):
+    """경매 사건 표기를 (법원, 연도+사건구분, 사건 일련번호, 물건번호) 로 나눈다.
+
+    경매사건검색 화면은 연도를 드롭다운으로 고르고 일련번호만 입력하므로 번호를 따로 뺀다.
+    '2025타경103509' → ('2025타경', '103509'). 형식이 다르면 사건번호 전체를 번호 자리에 둔다.
+    """
+    sa_no = str(row.get("사건번호") or "").strip()
+    m = CASE_NO_RE.fullmatch(sa_no)
+    head, no = (m.group(1) + m.group(2), m.group(3)) if m else ("", sa_no)
+    # 공매 행과 합치면서 물건번호가 실수형이 되므로 정수로 되돌린다.
+    return str(row.get("법원") or "").strip(), head, no, int(row.get("물건번호"))
+
+
 def risk_notes(row):
     """경고 컬럼에서 유찰 표시를 뺀 권리 메모 (경매)."""
     w = row.get("경고")
@@ -207,8 +235,8 @@ def format_item(rank, row, rank_label, rank_col):
     new = " 🆕" if str(row.get("신규") or "") == "Y" else ""
     name = html.escape(short_name(row))
 
-    link = row.get("온비드링크")
-    if isinstance(link, str) and link.startswith("http"):
+    link = item_link(row)
+    if link:
         name = f'<a href="{html.escape(link, quote=True)}">{name}</a>'
     lines = [f"{rank}. [{source}] {name}{new}"]
 
@@ -227,9 +255,9 @@ def format_item(rank, row, rank_label, rank_col):
 
     tail = f"   {rank_label} {fmt_man(row.get(rank_col))}"
     if source == "경매":
-        # 공매 행과 합치면서 물건번호가 실수형이 되므로 정수로 되돌린다.
-        case = f"{row.get('법원', '')} {row.get('사건번호', '')}-{int(row.get('물건번호'))}"
-        tail += f" · {html.escape(case.strip())}"
+        # 사건 일련번호는 <code> 로 감싸 텔레그램에서 눌러 복사할 수 있게 한다.
+        court, head, no, ser = court_case(row)
+        tail += f" · {html.escape(court)} {html.escape(head)}<code>{html.escape(no)}</code>-{ser}"
         notes = risk_notes(row)
         if notes:
             tail += f" · {html.escape(notes)}"
