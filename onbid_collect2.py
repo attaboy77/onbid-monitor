@@ -374,12 +374,27 @@ def build_dataframe(df, category):
         return ""
 
     df["경고"] = df["usbdNft"].fillna(0).map(warn_label)
-    df["온비드링크"] = (
-        "https://www.onbid.co.kr/op/cta/cltrdtl/collateralRealEstateDetail.do"
-        "?cltrHstrNo=" + df["onbidCltrno"].astype(str)
-    )
+    df["온비드링크"] = df.apply(onbid_detail_url, axis=1)
 
     return df
+
+
+# 차세대 온비드 물건 상세 (2026-10 확인). 예전 /op/cta/cltrdtl/collateralRealEstateDetail.do?cltrHstrNo= 는 404.
+# 네 값이 모두 있어야 열리고 하나라도 빠지면 500 이다. 넷 다 목록 API 응답에 들어 있다.
+# 회차(pbctNo·pbctCdtnNo)는 prepare_dataframe 에서 남긴 행의 것을 쓴다.
+ONBID_DETAIL_URL = "https://www.onbid.co.kr/op/cltrpbancinf/cltrdtl/CltrDtlController/mvmnCltrDtl.do"
+ONBID_DETAIL_KEYS = ["onbidCltrno", "onbidPbancNo", "pbctNo", "pbctCdtnNo"]
+
+
+def onbid_detail_url(row):
+    """API 한 행으로 온비드 물건 상세 주소를 만든다. 값이 하나라도 없으면 빈 문자열."""
+    values = []
+    for key in ONBID_DETAIL_KEYS:
+        value = pd.to_numeric(row.get(key), errors="coerce")
+        if pd.isna(value):
+            return ""
+        values.append(f"{key}={int(value)}")
+    return ONBID_DETAIL_URL + "?" + "&".join(values)
 
 
 KEEP_COLUMNS = [
