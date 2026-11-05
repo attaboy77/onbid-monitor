@@ -13,8 +13,11 @@
 섹션별 TOP 5 는 인수위험이 없는 물건만 골라 공매·경매를 합쳐서 줄 세운다.
     - 상가: 1층환산 평당필요월세 낮은 순
     - 주택: 평당필요월세 낮은 순 (주택은 층별계수를 쓰지 않는다)
-    - 인수위험: 공매는 '인수위험' 컬럼(선순위임차인 인수), 경매는 물건비고에서 뽑은 '경고' 중
-      INHERIT_RISK_WORDS 에 해당하는 단어가 있으면 제외한다.
+    - 인수위험: 공매는 '인수위험' 컬럼(선순위임차인 인수), 경매도 court_rights.py 가 채운 '인수위험'
+      컬럼이 비어 있지 않으면 제외한다. 그 컬럼이 없는 옛 경매 CSV(권리분석 전)는 물건비고에서 뽑은
+      '경고' 중 INHERIT_RISK_WORDS 에 해당하는 단어가 있으면 제외한다.
+    - 경매 권리확인이 미검증(명세서 작성 전, 현황조사서만 봄)·미조회(권리분석 TOP 20 밖)인 물건은
+      TOP 에 넣되 그 라벨을 붙인다.
     - 신규 물건은 🆕, 유찰 3회 이상은 ⚠ 로 표시한다.
 
 전송 실패(토큰 없음, 네트워크 오류, API 오류 등)는 경고만 남기고 항상 exit 0 으로
@@ -130,8 +133,11 @@ def load_section(slug, stamp):
     court = read_csv(OUT_DIR / f"court_{slug}_{stamp}.csv")
     if court is not None and not court.empty:
         court["출처"] = "경매"
-        warns = court["경고"].fillna("")
-        court["_위험"] = warns.map(lambda w: any(k in w for k in INHERIT_RISK_WORDS))
+        if "인수위험" in court.columns:
+            court["_위험"] = court["인수위험"].fillna("") != ""
+        else:   # court_rights.py 이전 CSV
+            warns = court["경고"].fillna("")
+            court["_위험"] = warns.map(lambda w: any(k in w for k in INHERIT_RISK_WORDS))
         court["전유평수"] = court["평수"]   # 경매 목록의 면적은 집합건물이면 전유면적이다
         frames.append(court)
 
@@ -249,12 +255,35 @@ def court_case(row):
     return str(row.get("법원") or "").strip(), head, no, int(row.get("물건번호"))
 
 
+# court_rights.py 의 권리확인 값 중 TOP 에 라벨로 붙일 것 (court_rights 가 이 모듈을 가져다 쓰므로 문자열로 둔다)
+UNVERIFIED_LABELS = ("미검증", "미조회")
+
+
 def risk_notes(row):
-    """경고 컬럼에서 유찰 표시를 뺀 권리 메모 (경매)."""
+    """경매 권리 메모. 권리확인 라벨 · 인수위험 · 인수보증금 · 경고(유찰 표시 제외).
+
+    권리분석(court_rights.py) 결과가 있으면 경고의 선순위·대항력 같은 단어는 인수위험이 대신하므로 뺀다.
+    """
+    notes, skip = [], ()
+    check = row.get("권리확인")
+    if not is_missing(check):
+        if check in UNVERIFIED_LABELS:
+            notes.append(str(check))
+        risk = row.get("인수위험")
+        if not is_missing(risk):
+            notes.append(str(risk))
+        deposit = row.get("인수보증금")
+        if not is_missing(deposit) and float(deposit) > 0:
+            notes.append(f"인수보증금 {fmt_price(deposit)}")
+        skip = INHERIT_RISK_WORDS
     w = row.get("경고")
-    if is_missing(w):
-        return ""
-    return " ".join(t for t in w.split() if "유찰" not in t and t not in ("⚠", "🔴"))
+    if not is_missing(w):
+        notes += [t for t in w.split() if "유찰" not in t and t not in ("⚠", "🔴") and t not in skip]
+    return " · ".join(notes)
+
+
+def is_unverified(row):
+    return row.get("권리확인") in UNVERIFIED_LABELS
 
 
 def format_item(rank, row, rank_label, rank_col):
@@ -318,6 +347,9 @@ def build_message(stamp):
         for rank, (_, row) in enumerate(top.iterrows(), 1):
             parts.append(format_item(rank, row, rank_label, rank_col))
             has_items = True
+        if any(is_unverified(row) for _, row in top.iterrows()):
+            parts.append("   <i>미검증: 매각물건명세서 작성 전이라 현황조사서 전입일만 확인 · "
+                         "미조회: 권리분석 대상(경매 TOP 20) 밖</i>")
 
     return "\n".join(parts) if has_items else None
 

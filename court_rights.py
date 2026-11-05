@@ -46,6 +46,8 @@ court_collect.py 가 만든 data/court_{commercial,residential}_YYYY-MM-DD.csv �
         인수권리 있음                  '매각으로 소멸되지 아니하는 것' 란이 채워져 있음
         법정지상권                     '매각에 따라 설정된 것으로 보는 지상권' 란이 채워져 있음
         주의(명세서 비고)              비고란에 '인수' 가 있음
+        주의(임차인 정보 불명)         권원이 '사무실임차인' 인데 전입(사업자등록)일이나 보증금이 비어 있음
+        주의(주거점유자)               권원이 '주거점유자' 인 점유자가 있음 (임차인인지 명세서만으로 알 수 없음)
     권리확인          명세서 / 미검증 / 미조회 / 조회실패
 
 명세서가 아직 없을 때 (권리확인 = 미검증)
@@ -61,8 +63,15 @@ TOP 20 밖 (권리확인 = 미조회)
 
 캐시
 ----
-    data/court_rights_cache.json   {"문서ID:작성일": {"점유자": [...], "used": "YYYY-MM-DD"}}
-    같은 문서·작성일이면 PDF 를 다시 받지 않는다 (재작성되면 작성일이 바뀐다). 60일 넘게 안 쓴 항목은 지운다.
+    data/court_rights_cache.json   {"문서ID:작성일": {"점유자": [...], "v": 파서버전, "used": "YYYY-MM-DD"}}
+    같은 문서·작성일·파서버전이면 PDF 를 다시 받지 않는다 (재작성되면 작성일이 바뀐다). 60일 넘게 안 쓴 항목은 지운다.
+
+이름 검사
+---------
+    CSV·캐시를 쓰기 전에 validate_output / validate_cache 로 판정 컬럼과 캐시가 허용된 값(날짜·금액·
+    정해진 판정 문구)만 담고 있는지, name_guard 로 CSV 전체에 이름처럼 보이는 문자열이 없는지 본다.
+    하나라도 걸리면 아무것도 쓰지 않고 exit 1 하며, GitHub Actions 에서는 커밋 직전의
+    name_guard.py 단계가 이를 이어받아 실행을 실패시킨다.
     상세 JSON 은 문서 ID·작성일을 알아야 해서 TOP 20 마다 매번 받는다.
 
 실행
@@ -84,6 +93,7 @@ import pdfplumber
 import requests
 
 from court_collect import HEADERS as COURT_HEADERS
+from name_guard import has_hangul, mark_blocked, report, scan_frame
 from onbid_telegram import INHERIT_RISK_WORDS, SECTIONS, warn
 
 try:
@@ -158,6 +168,17 @@ COLUMN_PREFIXES = {
 TABLE_END_PREFIXES = ("<비고>", "※", "등기된부동산", "매각에따라", "비고란")
 # 한 점유자의 행은 정보출처가 이 순서로 나온다. 순서가 되돌아가면 다음 점유자다.
 SOURCE_ORDER = ("등기", "현황", "권리")
+
+# 권원이 이렇게 적힌 점유자는 위 판정으로 거를 수 없어 플래그를 단다.
+OFFICE_LESSEE_TITLE = "사무실임차인"      # 전입(사업자등록)일·보증금 중 하나라도 비어 있으면
+RESIDENT_TITLE = "주거점유자"             # 임차인인지 아닌지 명세서만으로 알 수 없음
+FLAG_LESSEE_UNKNOWN = "임차인정보불명"
+FLAG_RESIDENT = "주거점유자"
+RISK_LESSEE_UNKNOWN = "주의(임차인 정보 불명)"
+RISK_RESIDENT = "주의(주거점유자)"
+
+# 캐시 항목의 파서 버전. 파서가 남기는 내용이 바뀌면 올린다 (예전 항목은 PDF 를 다시 받는다).
+PARSER_VERSION = 2
 
 SPEC = "명세서"
 UNVERIFIED = "미검증"
@@ -309,16 +330,24 @@ def parse_spec_pdf(pdf_bytes):
 
     result = []
     for occ in occupants:
-        has_values = occ["move_in"] or occ["deposit"]
-        lessee = any(LESSEE_RE.search(t) for t in occ["titles"]) or (not any(occ["titles"]) and has_values)
-        if not lessee or not has_values:
-            continue        # 소유자·채무자 점유, '조사된 임차내역 없음' 같은 행
-        result.append({
+        values = {
             "전입": min(occ["move_in"]) if occ["move_in"] else None,
             "확정": max(occ["fixed"]) if occ["fixed"] else None,
             "보증금": max(occ["deposit"]) if occ["deposit"] else None,
             "배당요구": min(occ["dividend"]) if occ["dividend"] else None,
-        })
+        }
+        # 판정만 할 수 없는 두 경우는 표시(플래그)를 달아 남긴다. 점유자 칸 값은 여전히 읽지 않는다.
+        if any(RESIDENT_TITLE in t for t in occ["titles"]):
+            result.append({**values, "플래그": FLAG_RESIDENT})
+            continue
+        if any(OFFICE_LESSEE_TITLE in t for t in occ["titles"]) and not (occ["move_in"] and occ["deposit"]):
+            result.append({**values, "플래그": FLAG_LESSEE_UNKNOWN})
+            continue
+        has_values = occ["move_in"] or occ["deposit"]
+        lessee = any(LESSEE_RE.search(t) for t in occ["titles"]) or (not any(occ["titles"]) and has_values)
+        if not lessee or not has_values:
+            continue        # 소유자·채무자 점유, '조사된 임차내역 없음' 같은 행
+        result.append(values)
     return result
 
 
@@ -330,12 +359,14 @@ def judge_spec(occupants, senior_date, deadline, info):
     """명세서 점유자 목록 + 머리 항목으로 (인수위험, 인수보증금, 선순위임차인수)."""
     risks = []
     deposit_sum, senior_n = 0, 0
+    # 주거점유자는 임차인인지 알 수 없어 선순위 판정에 넣지 않고 아래에서 주의만 단다.
+    lessees = [o for o in occupants if o.get("플래그") != FLAG_RESIDENT]
     if senior_date is None:
-        if any(o["전입"] for o in occupants):
+        if any(o["전입"] for o in lessees):
             risks.append("주의(최선순위 불명)")
     else:
         takeover = caution = False
-        for o in occupants:
+        for o in lessees:
             if o["전입"] is None or o["전입"] >= senior_date:
                 continue
             senior_n += 1
@@ -351,6 +382,10 @@ def judge_spec(occupants, senior_date, deadline, info):
         elif caution:
             risks.append("주의(선순위임차인 배당요구)")
 
+    if any(o.get("플래그") == FLAG_LESSEE_UNKNOWN for o in occupants):
+        risks.append(RISK_LESSEE_UNKNOWN)
+    if any(o.get("플래그") == FLAG_RESIDENT for o in occupants):
+        risks.append(RISK_RESIDENT)
     if has_content(info.get("ndstrcRghCtt")):
         risks.append("인수권리 있음")
     if has_content(info.get("sprfcExstcDts")):
@@ -478,11 +513,11 @@ def check_item(client, row, cache, stamp):
         return {**out, "권리확인": UNVERIFIED, "인수위험": risk, "인수보증금": None, "선순위임차인수": n}
 
     key = f"{doc_id}:{out['명세서작성일']}"
-    if key not in cache:
+    if cache.get(key, {}).get("v") != PARSER_VERSION:
         occupants = parse_spec_pdf(client.spec_pdf(code, item_no, info))
         if occupants is None:
             raise RuntimeError("명세서에서 점유자 표를 찾지 못함")
-        cache[key] = {"점유자": occupants}
+        cache[key] = {"점유자": occupants, "v": PARSER_VERSION}
         time.sleep(0.5)
     cache[key]["used"] = stamp
 
@@ -499,10 +534,89 @@ def load_cache():
         return {}
 
 
-def save_cache(cache, stamp):
+def prune_cache(cache, stamp):
     cutoff = (datetime.strptime(stamp, "%Y-%m-%d") - timedelta(days=CACHE_KEEP_DAYS)).strftime("%Y-%m-%d")
-    kept = {k: v for k, v in cache.items() if v.get("used", "") >= cutoff}
-    CACHE_PATH.write_text(json.dumps(kept, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+    return {k: v for k, v in cache.items() if v.get("used", "") >= cutoff}
+
+
+def cache_text(cache):
+    return json.dumps(cache, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# 이름 검사 (쓰기 전). name_guard.py 도 커밋 직전에 같은 함수로 디스크 파일을 다시 본다.
+# 문제 문자열에는 위치만 넣고 값은 넣지 않는다 (Actions 로그에 남는다).
+# ---------------------------------------------------------------------------
+
+RISK_LABELS = {
+    "선순위임차인 인수", "주의(선순위임차인 배당요구)", "주의(최선순위 불명)", "인수권리 있음", "법정지상권",
+    "주의(명세서 비고)", RISK_LESSEE_UNKNOWN, RISK_RESIDENT, "주의(현황조사 전입)", "권리 미확인(조회 실패)",
+}
+LEGACY_RISK_RE = re.compile(r"물건비고: (?:" + "|".join(INHERIT_RISK_WORDS) + r")(?: (?:"
+                            + "|".join(INHERIT_RISK_WORDS) + r"))*")
+NUMBER_RE = re.compile(r"\d+(?:\.0)?")
+OUTPUT_FORMATS = {
+    "인수보증금": NUMBER_RE,
+    "선순위임차인수": NUMBER_RE,
+    "등기최선순위일자": NUMBER_RE,
+    "명세서작성일": NUMBER_RE,
+    "배분요구종기": re.compile(r"\d{4}/\d{2}/\d{2}"),
+}
+OCCUPANT_KEYS = {"전입", "확정", "보증금", "배당요구"}
+FLAGS = {FLAG_LESSEE_UNKNOWN, FLAG_RESIDENT}
+
+
+def validate_output(df):
+    """판정 컬럼이 허용된 값만 담고 있는지. df 는 dtype=str, 빈 칸은 '' 로 읽은 것."""
+    problems = []
+    for idx, row in df.iterrows():
+        if row["권리확인"] not in (SPEC, UNVERIFIED, NOT_CHECKED, FAILED):
+            problems.append(f"행 {idx} '권리확인': 허용되지 않은 값 ({len(row['권리확인'])}글자)")
+        risk = row["인수위험"]
+        bad = [p for p in risk.split(" / ") if p not in RISK_LABELS and not LEGACY_RISK_RE.fullmatch(p)] if risk else []
+        if bad:
+            problems.append(f"행 {idx} '인수위험': 허용되지 않은 문구 {len(bad)}개")
+        for col, pattern in OUTPUT_FORMATS.items():
+            value = row.get(col, "")
+            if value and not pattern.fullmatch(value):
+                problems.append(f"행 {idx} '{col}': 형식이 다른 값 ({len(value)}글자)")
+    return problems
+
+
+def validate_cache(cache):
+    """캐시가 날짜·금액·정해진 플래그만 담고 있는지."""
+    problems = []
+    if not isinstance(cache, dict):
+        return ["최상위가 객체가 아님"]
+    for n, (key, entry) in enumerate(cache.items()):
+        where = f"항목 {n}"
+        if has_hangul(key) or len(key) > 100:
+            problems.append(f"{where}: 키 형식이 다름")
+        if not isinstance(entry, dict) or set(entry) - {"점유자", "v", "used"}:
+            problems.append(f"{where}: 허용되지 않은 키")
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(entry.get("used", ""))):
+            problems.append(f"{where}: used 형식이 다름")
+        for occ in entry.get("점유자") or []:
+            if not isinstance(occ, dict) or set(occ) - OCCUPANT_KEYS - {"플래그"}:
+                problems.append(f"{where}: 점유자에 허용되지 않은 키")
+                continue
+            if any(occ.get(k) is not None and not isinstance(occ[k], int) for k in OCCUPANT_KEYS):
+                problems.append(f"{where}: 점유자 값이 숫자가 아님")
+            if "플래그" in occ and occ["플래그"] not in FLAGS:
+                problems.append(f"{where}: 허용되지 않은 플래그")
+    return problems
+
+
+def check_before_write(frames, cache):
+    """쓰려는 CSV(전체 칸)와 캐시를 검사. 문제 목록."""
+    problems = []
+    for path, df in frames:
+        on_disk = pd.read_csv(io.StringIO(df.to_csv(index=False)), dtype=str, keep_default_na=False)
+        problems += [f"{where}: 이름 의심 문자열 ({n}글자)" for where, n in scan_frame(on_disk, path.name)]
+        problems += [f"{path.name} {p}" for p in validate_output(on_disk)]
+    problems += [f"{CACHE_PATH.name} {p}" for p in validate_cache(json.loads(cache_text(cache)))]
+    return problems
 
 
 def latest_stamp():
@@ -517,10 +631,11 @@ def legacy_risk(warning):
 
 
 def process(path, client, cache, stamp, rank_col):
+    """판정 컬럼을 붙인 DataFrame. 쓰지는 않는다 (main 에서 검사 뒤에 쓴다)."""
     df = pd.read_csv(path, encoding="utf-8-sig", dtype={"물건관리번호": str})
     print(f"\n대상 CSV: {path} ({len(df)}건)")
     if df.empty:
-        return
+        return None
 
     df["권리확인"] = NOT_CHECKED
     df["인수위험"] = df["경고"].map(legacy_risk)
@@ -542,10 +657,10 @@ def process(path, client, cache, stamp, rank_col):
         print(f"  {label}: {result['권리확인']} · 선순위 {result['선순위임차인수']}명 · {result['인수위험'] or '인수 요인 없음'}")
         time.sleep(0.5)
 
-    df.to_csv(path, index=False, encoding="utf-8-sig")
     counts = df.loc[top.index, "권리확인"].value_counts().to_dict()
     risky = (df.loc[top.index, "인수위험"] != "").sum()
-    print(f"  TOP {len(top)}: {counts} · 인수위험 {risky}건 → {path} 에 덮어썼습니다.")
+    print(f"  TOP {len(top)}: {counts} · 인수위험 {risky}건")
+    return df
 
 
 def main():
@@ -566,9 +681,24 @@ def main():
     except Exception as exc:
         warn(f"법원경매 사이트 접속 실패로 권리분석을 건너뜁니다 ({type(exc).__name__}: {str(exc)[:120]})")
         return
+
+    frames = []
     for path, rank_col in paths:
-        process(path, client, cache, stamp, rank_col)
-    save_cache(cache, stamp)
+        df = process(path, client, cache, stamp, rank_col)
+        if df is not None:
+            frames.append((path, df))
+    cache = prune_cache(cache, stamp)
+
+    problems = check_before_write(frames, cache)
+    if problems:
+        report(problems)
+        mark_blocked()
+        sys.exit("이름처럼 보이는 문자열이 있어 CSV·캐시를 쓰지 않았습니다.")
+
+    for path, df in frames:
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        print(f"{path} 에 덮어썼습니다.")
+    CACHE_PATH.write_text(cache_text(cache), encoding="utf-8")
 
 
 if __name__ == "__main__":

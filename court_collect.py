@@ -45,6 +45,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import requests
 
+from name_guard import mask_names
 # 수익률 역산 가정과 공통 필터는 온비드 수집기와 같은 값을 쓴다. 한쪽만 바꾸면 비교가 어긋난다.
 from onbid_collect2 import (
     CATEGORIES as ONBID_CATEGORIES,
@@ -348,7 +349,8 @@ def group_items(raw_rows, category):
             "최저가율(%)": round(minimum / appraisal * 100) if appraisal else None,
             "매각기일": main.get("maeGiil", ""),
             "매각장소": main.get("maePlace", ""),
-            "물건비고": remark,
+            # 자유 기재란에 임차인 실명이 섞여 온다. 경고는 원문으로 뽑고 저장할 때는 이름을 가린다.
+            "물건비고": mask_names(remark),
         })
     return pd.DataFrame(items)
 

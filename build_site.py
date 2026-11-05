@@ -9,6 +9,8 @@ site/index.html 한 장으로 만든다. 데이터는 HTML 안에 JSON으로 박
     - 상가/주택 탭, 출처(전체/공매/경매) 필터, 인수위험 제외 토글, 검색
     - 컬럼 머리글 클릭으로 정렬 (휴대폰에서는 카드 보기 + 정렬 드롭다운)
     - 인수위험 물건은 붉은 배경으로 표시 (판정 기준은 onbid_telegram.load_section 과 같다)
+    - 경매 인수위험·비고 칸은 onbid_telegram.risk_notes (권리확인 라벨·인수위험·인수보증금·경고).
+      미검증·미조회 물건은 주황 글씨
     - 물건명 옆 '🗺 지도': 카카오맵 주소 검색 (onbid_telegram.map_link, 주소를 못 뽑으면 생략)
     - 물건명에 링크: 공매는 온비드 물건 상세, 경매는 법원경매 경매사건검색 화면
       (법원경매는 물건별 고정 주소가 없다. onbid_telegram.COURT_CASE_SEARCH_URL 참고.
@@ -37,6 +39,7 @@ from onbid_telegram import (
     latest_stamp,
     map_link,
     load_section,
+    is_unverified,
     risk_notes,
     short_name,
 )
@@ -116,6 +119,7 @@ def to_record(row):
         "deadline": deadline,
         "verdict": "" if is_missing(row.get("판정")) else str(row.get("판정")),
         "riskFlag": bool(row["_위험"]),
+        "unverified": court and is_unverified(row),
         "risk": risk,
         "new": str(row.get("신규") or "") == "Y",
     }
@@ -262,7 +266,7 @@ tr.risk td:first-child { box-shadow: inset 3px 0 var(--risk-text); }
     <input type="search" id="q" placeholder="지역·물건명·사건번호 검색">
     <select id="mobileSort" aria-label="정렬"></select>
   </div>
-  <div class="count"><span id="count"></span> · <span class="legend"><i></i>인수위험 물건</span></div>
+  <div class="count"><span id="count"></span> · <span class="legend"><i></i>인수위험 물건</span> · <span class="warnN">미검증</span>: 명세서 작성 전(현황조사서만 확인) · <span class="warnN">미조회</span>: 권리분석 TOP 20 밖</div>
   <div class="wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 </main>
 <script>
@@ -335,7 +339,7 @@ function cell(c, it) {
     case "failed": return `<td class="n">${k}<span class="${it.failed >= 3 ? "warnN" : ""}">${it.failed}회</span></td>`;
     case "deadline": return `<td>${k}${esc(it.deadline || "-")}</td>`;
     case "verdict": return it.verdict ? `<td>${k}${esc(it.verdict)}</td>` : `<td class="hideM">-</td>`;
-    case "risk": return it.risk ? `<td class="wide">${k}<span class="${it.riskFlag ? "risktxt" : ""}">${esc(it.risk)}</span></td>` : `<td class="hideM"></td>`;
+    case "risk": return it.risk ? `<td class="wide">${k}<span class="${it.riskFlag ? "risktxt" : it.unverified ? "warnN" : ""}">${esc(it.risk)}</span></td>` : `<td class="hideM"></td>`;
   }
 }
 
