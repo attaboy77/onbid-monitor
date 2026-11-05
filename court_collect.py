@@ -422,7 +422,7 @@ def build_dataframe(raw_rows, category):
 # ---------------------------------------------------------------------------
 
 def main():
-    # GitHub Actions 러너는 UTC 라 08:00 KST 실행 때 date.today() 가 전날이 된다.
+    # GitHub Actions 러너는 UTC 라 07:37 KST 실행 때 date.today() 가 전날이 된다.
     # 시작일이 과거면 검색 결과가 0건이 되므로 한국 날짜를 쓴다.
     start = datetime.now(KST).date()
     end = start + timedelta(days=BID_DAYS)
