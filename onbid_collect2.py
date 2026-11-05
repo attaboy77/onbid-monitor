@@ -139,6 +139,28 @@ ANNUAL_OPEX = 1_000_000      # 연간 경비 (재산세·수선충당 등)
 # 수집
 # ---------------------------------------------------------------------------
 
+# 공공데이터포털 API 는 서울처럼 페이지가 많은 지역을 넘기다 가끔 응답이 30초 넘게 멈춘다.
+# 예전에는 한 번 타임아웃이 나면 그 지역의 나머지 페이지를 통째로 버려서 그날 공매가 0건이 됐다
+# (2026-10-29~11-05 중 6일). 그래서 같은 페이지를 간격을 늘려 가며 다시 요청한다.
+RETRY_WAITS = (5, 15, 45)      # 재시도 전 대기(초). 실패하면 첫 시도 포함 총 4번 요청한다
+REQUEST_TIMEOUT = (10, 60)     # (연결, 응답) 초
+
+
+def get_with_retry(query):
+    for attempt, wait in enumerate((*RETRY_WAITS, None), 1):
+        try:
+            response = requests.get(ENDPOINT, params=query, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            if response.status_code < 500:
+                return response
+            err = requests.HTTPError(f"HTTP {response.status_code}")
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            err = exc
+        if wait is None:
+            raise err
+        print(f"    ! 페이지 {query['pageNo']} 요청 실패 ({type(err).__name__}), {wait}초 뒤 재시도 {attempt}/{len(RETRY_WAITS)}")
+        time.sleep(wait)
+
+
 def fetch_page(params, page, rows=None):
     rows = rows or PAGE_ROWS
     query = {
@@ -151,7 +173,7 @@ def fetch_page(params, page, rows=None):
         **params,
     }
     global DEBUG
-    response = requests.get(ENDPOINT, params=query, headers=HEADERS, timeout=30)
+    response = get_with_retry(query)
 
     if DEBUG:
         shown = response.url
@@ -493,17 +515,27 @@ def main():
     print(f"인증키 길이: {len(SERVICE_KEY)}자 (끝 4자리: ...{SERVICE_KEY[-4:]})")
 
 
-    raw = []
+    raw, failed = [], []
     for target in TARGETS:
         try:
             raw.extend(collect_region(target))
         except requests.RequestException as exc:
             print(f"  ! 요청 실패: {exc}")
+            failed.append(" ".join(target.values()))
+
+    # 일부 지역이라도 못 받았으면 결과가 불완전하다. 불완전한 결과를 저장하면 그날 CSV 가 0건처럼 보이고
+    # 신규 판별용 latest.json 까지 덮어써서 다음 날 멀쩡한 물건이 '신규'로 쏟아진다. 그래서 아무것도
+    # 저장하지 않고 종료 코드 1 로 끝낸다. 워크플로는 이 단계가 실패해도 계속 진행하고, 그날 파일이
+    # 없으니 텔레그램에 '공매 수집 파일 없음' 경고가 붙고 웹페이지는 직전 날짜를 보여 준다.
+    if failed or not raw:
+        print(f"\n::error::온비드 수집 불완전 — 실패 지역: {', '.join(failed) or '없음'}, 수집 {len(raw)}건. 저장하지 않습니다.")
+        sys.exit(1)
 
     print(f"\n총 {len(raw)}건 수집. 필터를 적용합니다.")
-    if not raw:
-        return
+    save_categories(raw)
 
+
+def save_categories(raw):
     base = prepare_dataframe(raw)
 
     for category in CATEGORIES:

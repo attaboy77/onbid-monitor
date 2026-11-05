@@ -39,6 +39,7 @@ import html
 import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from pathlib import Path
 
@@ -120,7 +121,7 @@ def load_section(slug, stamp):
 
     onbid = read_csv(OUT_DIR / f"onbid_{slug}_detail_{stamp}.csv")
     if onbid is None:
-        if (OUT_DIR / f"onbid_{slug}_{stamp}.csv").exists():
+        if csv_rows(OUT_DIR / f"onbid_{slug}_{stamp}.csv"):   # 목록이 0건이면 상세가 없는 게 정상
             warn(f"onbid_{slug}_detail_{stamp}.csv 가 없어 공매 {slug} 를 건너뜁니다 (상세조회 실패 추정).")
     elif not onbid.empty:
         onbid["출처"] = "공매"
@@ -325,10 +326,50 @@ def format_item(rank, row, rank_label, rank_col):
     return "\n".join(lines)
 
 
-def build_message(stamp):
-    """보낼 메시지를 만든다. 보낼 내용이 없으면 None."""
+def csv_rows(path):
+    """CSV 행 수. 파일이 없으면 None, 읽을 수 없으면 0 으로 본다."""
+    if not path.exists():
+        return None
+    try:
+        return len(pd.read_csv(path, encoding="utf-8-sig"))
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+        return 0
+
+
+def collection_issues(stamp):
+    """그날 수집이 비었거나 빠진 출처를 사람이 읽을 문장으로 돌려준다. 이상이 없으면 빈 리스트."""
+    issues = []
+    for slug, title, _, _ in SECTIONS:
+        label = title.split(" ", 1)[-1]
+        onbid_n = csv_rows(OUT_DIR / f"onbid_{slug}_{stamp}.csv")
+        if onbid_n is None:
+            issues.append(f"공매 {label}: 수집 파일 없음 (온비드 수집 실패)")
+        elif onbid_n == 0:
+            issues.append(f"공매 {label}: 0건 (온비드 API 가 빈 결과를 돌려줌)")
+        elif not (OUT_DIR / f"onbid_{slug}_detail_{stamp}.csv").exists():
+            issues.append(f"공매 {label}: 목록 {onbid_n}건인데 상세 파일 없음 (상세조회·지표 단계 실패)")
+
+        court_n = csv_rows(OUT_DIR / f"court_{slug}_{stamp}.csv")
+        if court_n is None:
+            issues.append(f"경매 {label}: 수집 파일 없음 (법원경매 수집 실패)")
+        elif court_n == 0:
+            issues.append(f"경매 {label}: 0건")
+    return issues
+
+
+def build_message(stamp, expected=None):
+    """보낼 메시지를 만든다. 수집 이상이 있으면 맨 위에 경고를 붙이고, 물건이 없어도 경고는 보낸다.
+    expected 는 오늘 나왔어야 할 날짜(워크플로 실행 시 한국 날짜). 보낼 내용이 전혀 없으면 None."""
     parts = [f"<b>경매·공매 알림 ({html.escape(stamp)})</b>"]
     has_items = False
+
+    issues = []
+    if expected and stamp != expected:
+        issues.append(f"{expected} 수집 결과 파일이 하나도 없습니다. 아래는 {stamp} 데이터입니다")
+    issues += collection_issues(stamp)
+    if issues:
+        parts.append("\n⚠️ <b>수집 이상</b> — GitHub Actions 로그를 확인하세요")
+        parts.extend(f"• {html.escape(msg)}" for msg in issues)
 
     for slug, title, rank_col, rank_label in SECTIONS:
         df = load_section(slug, stamp)
@@ -351,7 +392,9 @@ def build_message(stamp):
             parts.append("   <i>미검증: 매각물건명세서 작성 전이라 현황조사서 전입일만 확인 · "
                          "미조회: 권리분석 대상(경매 TOP 20) 밖</i>")
 
-    return "\n".join(parts) if has_items else None
+    if not has_items and issues:
+        parts.append("\n오늘은 보낼 물건이 없습니다. 웹페이지는 물건이 있는 가장 최근 날짜를 보여 줍니다.")
+    return "\n".join(parts) if has_items or issues else None
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +446,13 @@ def main():
         warn("data/ 에 수집 결과 CSV가 없어 텔레그램 알림을 건너뜁니다.")
         return
 
-    text = build_message(stamp)
+    # 워크플로에서 돌 때는 오늘(한국 날짜) 파일이 있어야 한다. 수집이 전부 실패하면 latest_stamp() 가
+    # 전날을 고르므로, 그대로 보내면 어제 물건이 오늘 알림처럼 나간다.
+    expected = None
+    if not args and os.environ.get("GITHUB_ACTIONS") == "true":
+        expected = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+
+    text = build_message(stamp, expected)
     if text is None:
         print(f"{stamp} 에 보낼 물건이 없어 텔레그램 메시지를 보내지 않습니다.")
         return

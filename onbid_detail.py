@@ -323,7 +323,9 @@ def process(src_path):
 
     merged = base.merge(detail_df, on="물건관리번호", how="left")
 
-    stamp = datetime.now().strftime("%Y-%m-%d")
+    # 결과 날짜는 원본 CSV 의 날짜를 따른다. 예전에는 실행 날짜를 붙여서, 그날 온비드 수집이 실패하면
+    # 전날 목록을 다시 조회해 '오늘' 상세 파일로 저장하는 바람에 옛 물건이 오늘 것처럼 보일 수 있었다.
+    stamp = m.group(2) if m else datetime.now().strftime("%Y-%m-%d")
     out_path = OUT_DIR / f"onbid_{slug}_detail_{stamp}.csv"
     merged.to_csv(out_path, index=False, encoding="utf-8-sig")
 
@@ -339,6 +341,15 @@ def main():
         if not sources:
             sys.exit("data/ 폴더에 onbid_commercial_*.csv / onbid_residential_*.csv 가 없습니다. "
                      "먼저 onbid_collect2.py 를 실행하세요.")
+        # 그날 온비드 수집이 실패하면 가장 최근 목록이 이미 처리한 전날 것이다. 다시 조회하지 않는다.
+        todo = []
+        for p in sources:
+            m = SRC_NAME_RE.fullmatch(p.name)
+            if m and (OUT_DIR / f"onbid_{m.group(1)}_detail_{m.group(2)}.csv").exists():
+                print(f"{p.name} 은 이미 상세조회한 날짜라 건너뜁니다 (오늘 온비드 수집 실패 추정).")
+            else:
+                todo.append(p)
+        sources = todo
 
     results = [process(p) for p in sources]
 

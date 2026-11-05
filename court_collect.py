@@ -39,6 +39,7 @@ tools/court_capture.py 로 캡처해 보니 물건상세검색은 아래 엔드�
 """
 
 import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -184,9 +185,36 @@ def search_body(target, category, page, start, end):
     }
 
 
+# 법원경매 사이트는 GitHub Actions 러너(해외 IP)에서 가끔 연결 자체가 안 된다
+# (2026-10-28, 11-05 에 모든 요청이 ConnectTimeout). 잠깐 끊긴 경우를 넘기도록 간격을 늘려 재시도한다.
+RETRY_WAITS = (10, 30, 90)     # 재시도 전 대기(초). 첫 시도 포함 총 4번
+REQUEST_TIMEOUT = (15, 60)     # (연결, 응답) 초
+
+
+class SiteUnreachable(Exception):
+    """재시도해도 사이트에 연결이 안 된다. 남은 지역도 시도하지 않는다."""
+
+
+def post_with_retry(session, body):
+    for attempt, wait in enumerate((*RETRY_WAITS, None), 1):
+        try:
+            response = session.post(SEARCH_URL, json=body, timeout=REQUEST_TIMEOUT)
+            if response.status_code < 500:
+                return response
+            err = requests.HTTPError(f"HTTP {response.status_code}")
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            err = exc
+        if wait is None:
+            if isinstance(err, (requests.ConnectionError, requests.ConnectTimeout)):
+                raise SiteUnreachable(str(err)) from err
+            raise err
+        print(f"    ! 요청 실패 ({type(err).__name__}), {wait}초 뒤 재시도 {attempt}/{len(RETRY_WAITS)}")
+        time.sleep(wait)
+
+
 def fetch_page(session, target, category, page, start, end):
     body = search_body(target, category, page, start, end)
-    response = session.post(SEARCH_URL, json=body, timeout=30)
+    response = post_with_retry(session, body)
     response.raise_for_status()
     try:
         payload = response.json()
@@ -404,15 +432,25 @@ def main():
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    problems = []
     for category in CATEGORIES:
-        raw = []
+        raw, failed = [], []
         for target in TARGETS:
             try:
                 raw.extend(collect_region(session, target, category, start_s, end_s))
+            except SiteUnreachable as exc:
+                print(f"  ! 사이트 연결 불가, 남은 수집을 중단합니다: {exc}")
+                print("::error::법원경매 사이트 연결 불가 — 오늘 경매 수집을 건너뜁니다.")
+                sys.exit(1)
             except requests.RequestException as exc:
                 print(f"  ! 요청 실패: {exc}")
+                failed.append(target["label"])
 
         print(f"\n[{category['구분']}] 총 {len(raw)}행 수집.")
+        # 일부 지역이 빠진 결과를 저장하면 신규 판별용 latest 파일이 어긋난다. 이 구분은 저장하지 않는다.
+        if failed:
+            problems.append(f"{category['구분']}: 실패 지역 {', '.join(failed)}")
+            continue
         if not raw:
             continue
 
@@ -426,6 +464,10 @@ def main():
             ["물건관리번호", "층", "용도", "감정가", "최저매각가", "최저가율(%)", "평수",
              "평당필요월세", "1층환산 평당필요월세", "매각기일", "경고"],
         )
+
+    if problems:
+        print(f"::error::법원경매 수집 불완전 — {' / '.join(problems)}. 해당 구분은 저장하지 않았습니다.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
