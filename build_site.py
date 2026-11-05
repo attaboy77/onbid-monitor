@@ -29,7 +29,9 @@ from pathlib import Path
 import pandas as pd
 
 from onbid_telegram import (
+    OUT_DIR,
     SECTIONS,
+    STAMP_RE,
     court_case,
     fmt_floor,
     fmt_man,
@@ -139,14 +141,33 @@ def build_data(stamp):
     return data
 
 
+def item_count(data):
+    return sum(len(s["items"]) for s in data["sections"])
+
+
 def main():
     stamp = sys.argv[1] if len(sys.argv) > 1 else latest_stamp()
     if not stamp:
         sys.exit("data/ 에 수집 결과 CSV가 없습니다.")
 
     data = build_data(stamp)
+    note = ""
+    # 날짜를 지정하지 않았는데 최신 날짜 수집이 통째로 비었으면(온비드 0건 + 경매 수집 실패 등)
+    # 빈 페이지 대신 물건이 있는 가장 최근 날짜를 보여 주고, 그 사실을 머리말에 적는다.
+    if len(sys.argv) <= 1 and item_count(data) == 0:
+        stamps = sorted({m.group(1) for p in OUT_DIR.glob("*.csv") if (m := STAMP_RE.fullmatch(p.name))}, reverse=True)
+        for prev in stamps:
+            if prev >= stamp:
+                continue
+            prev_data = build_data(prev)
+            if item_count(prev_data):
+                print(f"! {stamp} 수집 결과가 0건이라 {prev} 데이터로 페이지를 만듭니다.")
+                note = f" · ⚠ {stamp} 수집 결과가 없어 {prev} 데이터를 표시합니다"
+                stamp, data = prev, prev_data
+                break
+
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    html = TEMPLATE.replace("__DATA__", payload).replace("__STAMP__", stamp)
+    html = TEMPLATE.replace("__DATA__", payload).replace("__STAMP__", stamp).replace("__NOTE__", note)
 
     SITE_DIR.mkdir(exist_ok=True)
     (SITE_DIR / "index.html").write_text(html, encoding="utf-8")
@@ -251,7 +272,7 @@ tr.risk td:first-child { box-shadow: inset 3px 0 var(--risk-text); }
 <body>
 <header>
   <h1>경매·공매 물건</h1>
-  <div class="sub">수집일 __STAMP__ · 서울·고양 · 공매=온비드, 경매=법원경매</div>
+  <div class="sub">수집일 __STAMP__ · 서울·고양 · 공매=온비드, 경매=법원경매<span class="warnN">__NOTE__</span></div>
 </header>
 <main>
   <div class="tabs" role="tablist" id="tabs"></div>
